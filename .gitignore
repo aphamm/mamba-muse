@@ -1,3 +1,6 @@
+*.lock
+jg583___n_synth/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

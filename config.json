@@ -1,0 +1,29 @@
+{
+    "num_gpus": 0,
+    "batch_size": 1,
+    "learning_rate": 0.0002,
+    "adam_b1": 0.6,
+    "adam_b2": 0.99,
+    "lr_decay": 0.999,
+    "seed": 42,
+
+    "lambda_mel": 45,
+    "lambda_stft": 10,
+
+    "d_model": 256,
+    "d_state": 16,
+    "d_conv": 4,
+    "expand": 2,
+    "n_blocks": 12,
+
+    "num_epochs": 25,
+    "warmup_epoch": 5,
+
+    "num_workers": 4,
+
+    "sr": 16000,
+    "n_fft": 2048,
+    "n_mels": 80,
+    "fmin": 0,
+    "fmax": 8000
+}
