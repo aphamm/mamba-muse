@@ -1,6 +1,6 @@
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from mamba_ssm import Mamba
 from torch.nn.utils.parametrize import remove_parametrizations
 
 from utils import adaptive_instance_normalization, conv_weight_norm, get_padding
@@ -8,28 +8,22 @@ from utils import adaptive_instance_normalization, conv_weight_norm, get_padding
 LRELU_SLOPE = 0.1
 
 
-class SeqLayerNorm(nn.Module):
-    def __init__(self, shape, switch_dims):
+class ChannelLayerNorm(nn.Module):
+    # LayerNorm along the channel dimension
+    # Input is (B, C, L), so we transpose to (B, L, C) before applying LayerNorm
+    def __init__(self, shape):
         super().__init__()
-        self.switch_dims = switch_dims
         self.ln = nn.LayerNorm(shape)
 
     def forward(self, x):
-        x = self.ln(x.permute(self.switch_dims))  # (B, L, C)
-        return x.permute(self.switch_dims)  # (B, C, L)
+        _, C, L = x.size()
+        assert C <= 256, "Supports up to 256 channels"
+        assert L >= 2100, "Only supports at least 2100 timesteps"
+        x = self.ln(x.transpose(1, 2))
+        return x.transpose(1, 2)
 
 
-class AdaINLayer(nn.Module):
-    def __init__(self):
-        super(AdaINLayer, self).__init__()
-
-    def forward(self, content, style=None):
-        if style is None:
-            style = content
-        return adaptive_instance_normalization(content, style)
-
-
-class ResidualBlock(torch.nn.Module):
+class ResidualBlock(nn.Module):
     def __init__(self, channels, kernel_size=3, dilation=(1, 3)):
         super().__init__()
 
@@ -86,16 +80,30 @@ class ResidualBlock(torch.nn.Module):
             remove_parametrizations(self.dilation2[i], "weight")
 
 
-# Add --> LN --> Mamba
 class MambaBlock(nn.Module):
-    def __init__(self, out_channels, n_blocks):
+    def __init__(self, out_channels, n_blocks, cfg):
         super(MambaBlock, self).__init__()
-        self.ln = SeqLayerNorm(out_channels, (0, 2, 1))
-        self.mamba = nn.Linear(out_channels, out_channels)
+
+        self.n_blocks = n_blocks
+        self.lns = nn.ModuleList()
+        self.mambas = nn.ModuleList()
+
+        for _ in range(self.n_blocks):
+            self.lns.append(ChannelLayerNorm(out_channels))
+            self.mambas.append(
+                Mamba(
+                    d_model=out_channels,
+                    d_state=cfg.mamba["d_state"],
+                    d_conv=cfg.mamba["d_conv"],
+                    expand=cfg.mamba["expand"],
+                )
+            )
 
     def forward(self, x):
-        # (b d l) -> (b l d) -> (b d l)
-        x = x + self.mamba(self.ln(x).transpose(1, 2)).transpose(1, 2) 
+        # (B, C, L) -> mamba(ln(B, L, C)) -> (B, C, L)
+        for ln, mamba in zip(self.lns, self.mambas):
+            x = x + mamba(ln(x).transpose(1, 2)).transpose(1, 2)
+
         return x
 
 
@@ -107,6 +115,7 @@ class ConvBlock(nn.Module):
         kernel_size,
         num_mambas,
         bottleneck=False,
+        cfg=None,
     ):
         super().__init__()
 
@@ -121,7 +130,7 @@ class ConvBlock(nn.Module):
                 stride=1,
                 padding=0,
             ),
-            SeqLayerNorm(out_channels, (0, 2, 1)),
+            ChannelLayerNorm(out_channels),
             nn.LeakyReLU(LRELU_SLOPE),
         )
 
@@ -133,14 +142,14 @@ class ConvBlock(nn.Module):
                 stride=1,
                 padding=0,
             ),
-            SeqLayerNorm(out_channels, (0, 2, 1)),
+            ChannelLayerNorm(out_channels),
             nn.LeakyReLU(LRELU_SLOPE),
         )
 
         if not self.bottleneck:
             self.Avgpool = nn.AvgPool1d(kernel_size=2, stride=2, padding=0)
 
-        self.mamba = MambaBlock(out_channels, num_mambas)
+        self.mamba = MambaBlock(out_channels, num_mambas, cfg)
 
     def forward(self, x):
         x = self.conv1(self.pad(x))
@@ -163,7 +172,7 @@ class ConvBlock(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self):
+    def __init__(self, cfg):
         super().__init__()
 
         self.convs = nn.ModuleList()
@@ -184,12 +193,13 @@ class Encoder(nn.Module):
                     kernel_size=kernel_sizes[i],
                     num_mambas=num_mambas[i],
                     bottleneck=bottlenecks[i],
+                    cfg=cfg,
                 )
             )
-            self.lns.append(SeqLayerNorm(out_dims[i], (0, 2, 1)))
+            self.lns.append(ChannelLayerNorm(out_dims[i]))
 
     def forward(self, x):
-        residuals = [x]
+        residuals = []  # no residual for original signal
         for i, (conv, ln) in enumerate(zip(self.convs, self.lns)):
             x = conv(x)
             residuals.append(x)
@@ -197,7 +207,7 @@ class Encoder(nn.Module):
             if i < len(self.convs) - 1:
                 x = F.leaky_relu(x, LRELU_SLOPE)
 
-        # no skip connection for the shortest cut and reverse order
+        # no residual for bottleneck (reverse order)
         return x, residuals[:-1][::-1]
 
     def remove_weight_norm(self):
@@ -206,10 +216,10 @@ class Encoder(nn.Module):
 
 
 class Generator(nn.Module):
-    def __init__(self, h):
+    def __init__(self, cfg):
         super().__init__()
 
-        self.encoder = Encoder()
+        self.encoder = Encoder(cfg)
 
         self.num_kernels = 1
         self.num_upsamples = 4
@@ -228,7 +238,7 @@ class Generator(nn.Module):
                     transpose=True,
                 )
             )
-            self.mambas.append(MambaBlock(256 // (2 ** (i + 1)), 2))
+            self.mambas.append(MambaBlock(256 // (2 ** (i + 1)), 2, cfg))
 
         self.resblocks = nn.ModuleList()
         for i in range(self.num_upsamples):
@@ -244,23 +254,31 @@ class Generator(nn.Module):
             nn.Tanh(),
         )
 
-    def forward(self, x):
-        # (B, C, T) -> [B, 1, sr*T] --> [B, 256, sr*T/16]
-        x, residuals = self.encoder(x)
+        self.adain = adaptive_instance_normalization
+
+    def forward(self, content, style=None, alphas=(1.0, 1.0, 1.0, 1.0, 0.0)):
+        # (B, C=1, L=33600) --> (B, 256, 33600/(2**4)=2100)
+        x, residuals = self.encoder(content)
+
+        assert (
+            len(residuals) == self.num_upsamples
+        ), "Number of residuals should equal number of upsamples/downsamples"
+
+        # apply AdaIN style transfer to bottleneck AND all residuals
+        if style is not None:
+            style_encoded, style_residuals = self.encoder(style)
+            x = self.adain(x, style_encoded, alphas[0])
+            for i in range(self.num_upsamples):
+                residuals[i] = self.adain(
+                    residuals[i], style_residuals[i], alphas[i + 1]
+                )
 
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, LRELU_SLOPE) + residuals[i]
             x = self.mambas[i](self.ups[i](x))
             x = self.resblocks[i](x)
-            # xs = None
-            # for j in range(self.num_kernels):
-            #     if xs is None:
-            #         xs = self.resblocks[i * self.num_kernels + j](x)
-            #     else:
-            #         xs += self.resblocks[i * self.num_kernels + j](x)
-            # x = xs / self.num_kernels
 
-        return self.final_upsample(x) + residuals[-1]
+        return self.final_upsample(x)
 
     def remove_weight_norm(self):
         for layer in self.ups:

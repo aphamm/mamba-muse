@@ -1,29 +1,53 @@
 {
-    "num_gpus": 0,
-    "batch_size": 1,
-    "learning_rate": 0.0002,
-    "adam_b1": 0.6,
-    "adam_b2": 0.99,
-    "lr_decay": 0.999,
-    "seed": 42,
+    "info": {
+        "project_name": "mamba-muse",
+        "initial_date": "2024/11/20",
+        "researcher": "austin pham"
+    },
 
-    "lambda_mel": 45,
-    "lambda_stft": 10,
+    "wandb": {
+        "key": "SAVE_WANDB_KEY_HERE",
+        "project": "mamba-muse",
+        "run_name": "run-1"
+    },
 
-    "d_model": 256,
-    "d_state": 16,
-    "d_conv": 4,
-    "expand": 2,
-    "n_blocks": 12,
+    "path": {
+        "data": "aphamm/mamba-muse",
+        "data_dir": "data",
+        "checkpoint_dir": "checkpoints"
+    },
+    
+    "train": {
+        "seed": 42,
+        "num_workers": 4,
+        "batch_size": 64,
+        "learning_rate": 0.0002,
+        "adam_b1": 0.6,
+        "adam_b2": 0.99,
+        "lr_decay": 0.999,
+        "num_epochs": 25,
+        "warmup_epoch": 5
+    },
 
-    "num_epochs": 25,
-    "warmup_epoch": 5,
+    "hps": {
+        "lambda_mel": 45,
+        "lambda_stft": 10,
+        "gen_max_norm": 3.0,
+        "dis_max_norm": 2.0,
+        "patience": 5
+    },
 
-    "num_workers": 4,
+    "mamba": {
+        "d_state": 16,
+        "d_conv": 4,
+        "expand": 2
+    },
 
-    "sr": 16000,
-    "n_fft": 2048,
-    "n_mels": 80,
-    "fmin": 0,
-    "fmax": 8000
+    "audio": {
+        "sr": 16000,
+        "n_fft": 2048,
+        "n_mels": 80,
+        "fmin": 0,
+        "fmax": 8000
+    }
 }

@@ -2,14 +2,18 @@ import warnings
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
+import glob
 import itertools
 import json
+import os
 import time
 
 import torch
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler
+import wandb
+from torch.nn.utils import clip_grad_norm_
+from torch.optim.lr_scheduler import ExponentialLR
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import NSynthDataset
@@ -20,79 +24,104 @@ from gan import (
     generator_loss,
 )
 from model import Generator
-from utils import AttrDict, WarmupScheduler, loss_fn, mel_spectrogram
+from utils import (
+    AttrDict,
+    WarmupScheduler,
+    mel_spectrogram,
+    mr_stft_loss_fn,
+    save_epoch,
+)
+from validation import validation
 
 
-def train(rank, h):
-    torch.cuda.manual_seed(h.seed)
-
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-
-    print("using device:", device)
-
-    ##############
-    # LOAD MODEL #
-    ##############
-
-    generator = Generator(h).to(device)
-    mpd = MultiPeriodDiscriminator().to(device)
-    msd = MultiScaleDiscriminator().to(device)
-
-    if h.num_gpus > 1:
-        generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
-        mpd = DistributedDataParallel(mpd, device_ids=[rank]).to(device)
-        msd = DistributedDataParallel(msd, device_ids=[rank]).to(device)
-
-    optim_g = torch.optim.AdamW(
-        generator.parameters(), h.learning_rate, betas=[h.adam_b1, h.adam_b2]
-    )
-
-    optim_d = torch.optim.AdamW(
-        itertools.chain(msd.parameters(), mpd.parameters()),
-        h.learning_rate,
-        betas=[h.adam_b1, h.adam_b2],
-    )
-
-    scheduler_g_warmup = WarmupScheduler(
-        optim_g, warmup_steps=5, base_lr=h.learning_rate
-    )
-
-    scheduler_d_warmup = WarmupScheduler(
-        optim_g, warmup_steps=5, base_lr=h.learning_rate
-    )
-
-    scheduler_g_decay = torch.optim.lr_scheduler.ExponentialLR(
-        optim_g, gamma=h.lr_decay
-    )
-
-    scheduler_d_decay = torch.optim.lr_scheduler.ExponentialLR(
-        optim_d, gamma=h.lr_decay
-    )
+def train(cfg):
+    torch.cuda.manual_seed(cfg.train["seed"])
+    device = torch.device("cuda")
+    wandb.login(key=cfg.wandb["key"])
+    wandb.init(project=cfg.wandb["project"])
+    wandb.run.name = cfg.wandb["run_name"]
+    wandb.config.update(cfg)
+    previous_val_err = torch.inf
+    nums_did_not_improve = 0
+    stop_early = False
 
     ################
     # LOAD DATASET #
     ################
 
-    trainset = NSynthDataset(dataset="test", shuffle=False if h.num_gpus > 1 else True)
-    train_sampler = DistributedSampler(trainset) if h.num_gpus > 1 else None
+    trainset = NSynthDataset(split="train", shuffle=True, cfg=cfg)
     train_loader = DataLoader(
         trainset,  # single example of shape (64, 1, 32000)
-        num_workers=h.num_workers,
+        num_workers=cfg.train["num_workers"],
         shuffle=False,
-        sampler=train_sampler,
-        batch_size=h.batch_size,
+        sampler=None,
+        batch_size=cfg.train["batch_size"],
         pin_memory=True,
         drop_last=True,
     )
+    validset = NSynthDataset(split="validation", shuffle=True, cfg=cfg)
+    valid_loader = DataLoader(
+        validset,  # single example of shape (1, 1, 32000)
+        num_workers=1,
+        shuffle=True,
+        sampler=None,
+        batch_size=1,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    ##############
+    # LOAD MODEL #
+    ##############
+
+    gen = Generator(cfg).to(device)
+    mpd = MultiPeriodDiscriminator().to(device)
+    msd = MultiScaleDiscriminator().to(device)
+
+    lr = cfg.train["learning_rate"]
+    b1 = cfg.train["adam_b1"]
+    b2 = cfg.train["adam_b2"]
+
+    optim_g = torch.optim.AdamW(gen.parameters(), lr, betas=[b1, b2])
+    optim_d = torch.optim.AdamW(
+        itertools.chain(msd.parameters(), mpd.parameters()), lr, betas=[b1, b2]
+    )
+
+    ###############
+    # CHECKPOINTS #
+    ###############
+
+    os.makedirs(cfg.path["checkpoint_dir"], exist_ok=True)
+    results = glob.glob(os.path.join(cfg.path["checkpoint_dir"], "*"))
+
+    if len(results) > 0:
+        checkpoint = sorted(results)[-1]
+        print(f"loading checkpoint from {checkpoint}")
+
+        state_dict = torch.load(checkpoint, map_location=device)
+
+        gen.load_state_dict(state_dict["gen"])
+        mpd.load_state_dict(state_dict["mpd"])
+        msd.load_state_dict(state_dict["msd"])
+        last_epoch = state_dict["epoch"]
+        optim_g.load_state_dict(state_dict["optim_g"])
+        optim_d.load_state_dict(state_dict["optim_d"])
+    else:
+        state_dict, last_epoch = None, -1
+
+    warmup = cfg.train["warmup_epoch"]
+    gamma = cfg.train["lr_decay"]
+
+    scheduler_g_warmup = WarmupScheduler(optim_g, warmup_steps=warmup, base_lr=lr)
+    scheduler_d_warmup = WarmupScheduler(optim_g, warmup_steps=warmup, base_lr=lr)
+
+    scheduler_g_decay = ExponentialLR(optim_g, gamma=gamma, last_epoch=last_epoch)
+    scheduler_d_decay = ExponentialLR(optim_d, gamma=gamma, last_epoch=last_epoch)
 
     ###############
     # TRAIN MODEL #
     ###############
 
-    generator.train()
     mpd.train()
     msd.train()
 
@@ -100,43 +129,35 @@ def train(rank, h):
     losses_d = []
 
     # https://github.com/jik876/hifi-gan/blob/master/train.py
-    for epoch in range(h.num_epochs):
-        if rank == 0:
-            start = time.time()
-
-        if h.num_gpus > 1:
-            train_sampler.set_epoch(epoch)
+    for epoch in range(max(0, last_epoch), cfg.train["num_epochs"]):
+        start = time.time()
+        gen.train()
 
         for i, x in tqdm(
             enumerate(train_loader), unit="batches", total=len(train_loader)
         ):
-            x = torch.autograd.Variable(x.to(device, non_blocking=True))
-            y_hat = generator(x)
+            x = x.to(device, non_blocking=True)
+            y_hat = gen(x)
 
-            y_mel = mel_spectrogram(
-                x.squeeze(1),
-                sr=h.sr,
-                n_fft=h.n_fft,
-                n_mels=h.n_mels,
-                fmin=h.fmin,
-                fmax=h.fmax,
+            y_mel = torch.from_numpy(mel_spectrogram(x.squeeze(1), cfg)).to(
+                device, non_blocking=True
             )
 
-            y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
+            nan_mask = torch.isnan(y_hat)
+            if torch.any(nan_mask):
+                nan_indices = torch.nonzero(nan_mask)
+                print(f"nan_indices: {nan_indices}")
+                y_hat = torch.where(nan_mask, torch.zeros_like(y_hat), y_hat)
 
-            try:
-                y_hat_mel = mel_spectrogram(
-                    y_hat.squeeze(1),
-                    sr=h.sr,
-                    n_fft=h.n_fft,
-                    n_mels=h.n_mels,
-                    fmin=h.fmin,
-                    fmax=h.fmax,
-                )
-            except:
-                print("y_hat_mel error")
+            inf_mask = torch.isinf(y_hat)
+            if torch.any(inf_mask):
+                inf_indices = torch.nonzero(inf_mask)
+                print(f"inf_indices: {inf_indices}")
+                y_hat = torch.where(inf_mask, torch.zeros_like(y_hat), y_hat)
 
-            y_hat_mel = torch.autograd.Variable(y_hat_mel.to(device, non_blocking=True))
+            y_hat_mel = torch.from_numpy(mel_spectrogram(y_hat.squeeze(1), cfg)).to(
+                device, non_blocking=True
+            )
 
             ##################
             # GENERATOR LOSS #
@@ -145,10 +166,10 @@ def train(rank, h):
             optim_g.zero_grad()
 
             # L1 mel-spectrogram loss
-            loss_mel = F.l1_loss(y_mel, y_hat_mel) * h.lambda_mel
+            loss_mel = F.l1_loss(y_mel, y_hat_mel)
 
             # multi-resolution STFT loss
-            loss_stft = loss_fn(x, y_hat) * h.lambda_stft
+            loss_stft = mr_stft_loss_fn(cfg.audio["sr"])(x, y_hat)
 
             y_df_hat_r, y_df_hat_g, _, _ = mpd(x, y_hat)
             y_ds_hat_r, y_ds_hat_g, _, _ = msd(x, y_hat)
@@ -156,10 +177,16 @@ def train(rank, h):
             loss_gen_f, _ = generator_loss(y_df_hat_g)
             loss_gen_s, _ = generator_loss(y_ds_hat_g)
 
-            loss_gen = loss_mel + loss_stft + loss_gen_f + loss_gen_s
+            loss_gen = (
+                loss_mel * cfg.hps["lambda_mel"]
+                + loss_stft * cfg.hps["lambda_stft"]
+                + loss_gen_f
+                + loss_gen_s
+            )
             losses_g.append(loss_gen.item())
             loss_gen.backward()
-            torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=3.0)
+
+            clip_grad_norm_(gen.parameters(), max_norm=cfg.hps["gen_max_norm"])
             optim_g.step()
 
             ######################
@@ -169,7 +196,6 @@ def train(rank, h):
             optim_d.zero_grad()
 
             y_df_hat_r, y_df_hat_g, _, _ = mpd(x, y_hat.detach())
-
             loss_disc_f, _, _ = discriminator_loss(y_df_hat_r, y_df_hat_g)
 
             y_ds_hat_r, y_ds_hat_g, _, _ = msd(x, y_hat.detach())
@@ -179,52 +205,105 @@ def train(rank, h):
             losses_d.append(loss_disc.item())
             loss_disc.backward()
 
-            torch.nn.utils.clip_grad_norm_(mpd.parameters(), max_norm=2.0)
-            torch.nn.utils.clip_grad_norm_(msd.parameters(), max_norm=2.0)
+            torch.nn.utils.clip_grad_norm_(
+                mpd.parameters(), max_norm=cfg.hps["dis_max_norm"]
+            )
+            torch.nn.utils.clip_grad_norm_(
+                msd.parameters(), max_norm=cfg.hps["dis_max_norm"]
+            )
             optim_d.step()
 
-            if i % 25 == 0 and rank == 0:
-                loss_g_avg = sum(losses_g[-25:]) / 25
-                loss_d_avg = sum(losses_d[-25:]) / 25
-                print(
-                    f"epoch: {epoch + 1}, batch: {i + 1}, gen_loss: {loss_gen.item():.4f}, disc_loss: {loss_disc.item():.4f}"
-                )
+            #################
+            # WANDB LOGGING #
+            #################
 
-        if epoch < h.warmup_epoch:
+            wandb.log(
+                {
+                    "step": i + epoch * len(train_loader),
+                    "gen_loss": loss_gen.item(),
+                    "mel_loss": loss_mel.item(),
+                    "stft_loss": loss_stft.item(),
+                    "gen_f_loss": loss_gen_f.item(),
+                    "gen_s_loss": loss_gen_s.item(),
+                    "disc_loss": loss_disc.item(),
+                    "disc_f_loss": loss_disc_f.item(),
+                    "disc_s_loss": loss_disc_s.item(),
+                }
+            )
+
+        ##############
+        # VALIDATION #
+        ##############
+
+        val_err, original_audio, generated_audio, original_mel, generated_mel = (
+            validation(gen, valid_loader, device, cfg)
+        )
+
+        wandb.log(
+            {
+                "epoch": epoch,
+                "val_mel_loss": val_err,
+                "original_audio": original_audio,
+                "generated_audio": generated_audio,
+                "original_mel": original_mel,
+                "generated_mel": generated_mel,
+            }
+        )
+
+        ##################
+        # CHECK POINTING #
+        ##################
+
+        if val_err < previous_val_err:
+            previous_val_err = val_err
+            nums_did_not_improve = 0
+            save_epoch(
+                gen, mpd, msd, optim_g, optim_d, epoch, cfg.path["checkpoint_dir"]
+            )
+        else:
+            nums_did_not_improve += 1
+
+        ###############
+        # EPOCH STATS #
+        ###############
+
+        mins = (time.time() - start) / 60
+        loss_g_avg = sum(losses_g) / len(losses_g)
+        loss_d_avg = sum(losses_d) / len(losses_d)
+        lr = optim_g.param_groups[0]["lr"]
+
+        print(
+            f"epoch: {epoch}, gen_loss: {loss_g_avg:.6f}, disc_loss: {loss_d_avg:.6f}, lr: {lr:.6f}, time: {mins:.2f} mins"
+        )
+
+        ##################
+        # EARLY STOPPING #
+        ##################
+
+        stop_early = True if nums_did_not_improve > cfg.hps["patience"] else False
+
+        if stop_early:
+            print("stopping early to prevent overfitting")
+            break
+        elif epoch < cfg.train["warmup_epoch"]:
             scheduler_g_warmup.step()
             scheduler_d_warmup.step()
         else:
             scheduler_g_decay.step()
             scheduler_d_decay.step()
 
-        total_mins = (time.time() - start) / 60
-        loss_g_avg = sum(losses_g) / len(losses_g)
-        loss_d_avg = sum(losses_d) / len(losses_d)
-        if rank == 0:
-            print(
-                f"epoch: {epoch + 1}, gen_loss: {loss_g_avg:.4f}, disc_loss: {loss_d_avg:.4f}, time: {total_mins} mins"
-            )
 
-
-def run_train():
+def init_train():
     with open("config.json") as f:
         data = f.read()
 
     json_config = json.loads(data)
-    h = AttrDict(json_config)
+    cfg = AttrDict(json_config)
 
-    torch.manual_seed(h.seed)
+    torch.manual_seed(cfg.train["seed"])
 
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(h.seed)
-        h.num_gpus = torch.cuda.device_count()
-        h.batch_size = int(h.batch_size / h.num_gpus)
-        print("Batch size per GPU :", h.batch_size)
-    else:
+    if not torch.cuda.is_available():
+        "CUDA is not available. Exiting..."
         pass
 
-    train(0, h)
-
-
-if __name__ == "__main__":
-    main()
+    train(cfg)
