@@ -1,37 +1,79 @@
-import warnings
-
-warnings.simplefilter(action="ignore", category=FutureWarning)
-
 import glob
 import itertools
 import json
 import os
 import time
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import wandb
+from librosa import power_to_db
 from torch.nn.utils import clip_grad_norm_
 from torch.optim.lr_scheduler import ExponentialLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import NSynthDataset
-from gan import (
+from models import (
+    Generator,
     MultiPeriodDiscriminator,
     MultiScaleDiscriminator,
     discriminator_loss,
     generator_loss,
 )
-from model import Generator
 from utils import (
     AttrDict,
     WarmupScheduler,
     mel_spectrogram,
-    mr_stft_loss_fn,
     save_epoch,
+    stft_loss_fn,
+    wandb_mel,
 )
-from validation import validation
+
+
+def validation(gen, valid_loader, device, cfg):
+    gen.eval()
+    torch.cuda.empty_cache()
+    val_err_total = 0
+
+    with torch.no_grad():
+        for x in tqdm(valid_loader, unit="batches", total=len(valid_loader)):
+            x = x.to(device, non_blocking=True)
+            y_hat = gen(x)
+
+            y_mel = torch.from_numpy(mel_spectrogram(x.squeeze(1), cfg)).to(
+                device, non_blocking=True
+            )
+
+            y_hat_mel = torch.from_numpy(mel_spectrogram(y_hat.squeeze(1), cfg)).to(
+                device, non_blocking=True
+            )
+
+            loss_mel = F.l1_loss(y_mel, y_hat_mel)
+            val_err_total += loss_mel.item()
+
+        val_err = val_err_total / len(valid_loader)
+
+        # Audio Logging
+        y_np = x.cpu().detach().numpy().astype(float).reshape(-1)
+        y_hat_np = y_hat.cpu().detach().numpy().astype(float).reshape(-1)
+
+        original_audio = wandb.Audio(
+            y_np, sample_rate=cfg.audio["sr"], caption="original_audio"
+        )
+        generated_audio = wandb.Audio(
+            y_hat_np, sample_rate=cfg.audio["sr"], caption="generated_audio"
+        )
+
+        # Mel Spectrogram
+        y_mel = power_to_db(mel_spectrogram(x.squeeze(), cfg), ref=np.max)
+        y_hat_mel = power_to_db(mel_spectrogram(y_hat.squeeze(), cfg), ref=np.max)
+
+        original_mel = wandb_mel(y_mel, cfg.audio["sr"], "original_mel")
+        generated_mel = wandb_mel(y_hat_mel, cfg.audio["sr"], "generated_mel")
+
+        return val_err, original_audio, generated_audio, original_mel, generated_mel
 
 
 def train(cfg):
@@ -41,7 +83,7 @@ def train(cfg):
     wandb.init(project=cfg.wandb["project"])
     wandb.run.name = cfg.wandb["run_name"]
     wandb.config.update(cfg)
-    previous_val_err = torch.inf
+    previous_best_val_err = torch.inf
     nums_did_not_improve = 0
     stop_early = False
 
@@ -169,7 +211,7 @@ def train(cfg):
             loss_mel = F.l1_loss(y_mel, y_hat_mel)
 
             # multi-resolution STFT loss
-            loss_stft = mr_stft_loss_fn(cfg.audio["sr"])(x, y_hat)
+            loss_stft = stft_loss_fn(cfg.audio["sr"])(x, y_hat)
 
             y_df_hat_r, y_df_hat_g, _, _ = mpd(x, y_hat)
             y_ds_hat_r, y_ds_hat_g, _, _ = msd(x, y_hat)
@@ -213,10 +255,6 @@ def train(cfg):
             )
             optim_d.step()
 
-            #################
-            # WANDB LOGGING #
-            #################
-
             wandb.log(
                 {
                     "step": i + epoch * len(train_loader),
@@ -247,25 +285,23 @@ def train(cfg):
                 "generated_audio": generated_audio,
                 "original_mel": original_mel,
                 "generated_mel": generated_mel,
-            }
+            },
+            commit=False,  # wish to commit with next batch
         )
 
-        ##################
-        # CHECK POINTING #
-        ##################
-
-        if val_err < previous_val_err:
-            previous_val_err = val_err
+        if val_err < previous_best_val_err:
+            previous_best_val_err = val_err
             nums_did_not_improve = 0
+            print(f"saving epoch {epoch}")
             save_epoch(
                 gen, mpd, msd, optim_g, optim_d, epoch, cfg.path["checkpoint_dir"]
             )
         else:
             nums_did_not_improve += 1
 
-        ###############
-        # EPOCH STATS #
-        ###############
+        ################
+        # END OF EPOCH #
+        ################
 
         mins = (time.time() - start) / 60
         loss_g_avg = sum(losses_g) / len(losses_g)
@@ -275,10 +311,6 @@ def train(cfg):
         print(
             f"epoch: {epoch}, gen_loss: {loss_g_avg:.6f}, disc_loss: {loss_d_avg:.6f}, lr: {lr:.6f}, time: {mins:.2f} mins"
         )
-
-        ##################
-        # EARLY STOPPING #
-        ##################
 
         stop_early = True if nums_did_not_improve > cfg.hps["patience"] else False
 

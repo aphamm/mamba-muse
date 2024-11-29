@@ -3,9 +3,12 @@ import torch.nn.functional as F
 from mamba_ssm import Mamba
 from torch.nn.utils.parametrize import remove_parametrizations
 
-from utils import adaptive_instance_normalization, conv_weight_norm, get_padding
-
-LRELU_SLOPE = 0.1
+from .utils import (
+    LRELU_SLOPE,
+    adaptive_instance_normalization,
+    conv_weight_norm,
+    get_padding,
+)
 
 
 class ChannelLayerNorm(nn.Module):
@@ -17,8 +20,6 @@ class ChannelLayerNorm(nn.Module):
 
     def forward(self, x):
         _, C, L = x.size()
-        assert C <= 256, "Supports up to 256 channels"
-        assert L >= 2100, "Only supports at least 2100 timesteps"
         x = self.ln(x.transpose(1, 2))
         return x.transpose(1, 2)
 

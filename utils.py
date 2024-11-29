@@ -1,11 +1,9 @@
 import auraloss
 import librosa
 import torch
-import torch.nn as nn
 import wandb
-from torch.nn.utils.parametrizations import weight_norm
 
-from remote import CHECKPOINT_DIR
+from run_train import CHECKPOINT_DIR
 
 
 class AttrDict(dict):
@@ -58,7 +56,7 @@ def mel_spectrogram(x, cfg):
 
 
 # https://github.com/csteinmetz1/auraloss
-def mr_stft_loss_fn(sr):
+def stft_loss_fn(sr):
     return auraloss.freq.MultiResolutionSTFTLoss(
         fft_sizes=[1024, 2048, 8192],
         hop_sizes=[256, 512, 2048],
@@ -100,56 +98,3 @@ def wandb_mel(mel, sr, caption):
         ),
         caption=caption,
     )
-
-
-def calculate_mean_std(feat, eps=1e-5):
-    feat_std = (feat.var(dim=1, keepdim=True) + eps).sqrt()
-    feat_mean = feat.mean(dim=1, keepdim=True)
-    return feat_mean, feat_std
-
-
-# calculate statistic along the channel dimension
-# content and style shapes are (batch_size, channel, length)
-def adaptive_instance_normalization(content, style, alpha=1.0):
-    assert content.size() == style.size()
-    size = content.size()
-    style_mean, style_std = calculate_mean_std(style)
-    content_mean, content_std = calculate_mean_std(content)
-    normalized_feat = (content - content_mean.expand(size)) / content_std.expand(size)
-    stylized_feat = normalized_feat * style_std.expand(size) + style_mean.expand(size)
-    return alpha * stylized_feat + (1 - alpha) * content
-
-
-# https://arxiv.org/abs/1602.07868
-def conv_weight_norm(
-    in_channels,
-    out_channels,
-    kernel_size,
-    stride=1,
-    padding=0,
-    dilation=1,
-    transpose=False,
-):
-    conv_class = nn.ConvTranspose1d if transpose else nn.Conv1d
-    layer = weight_norm(
-        conv_class(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-        )
-    )
-    layer.weight.data.normal_(mean=0.0, std=0.01)
-    return layer
-
-
-def init_weights(m, mean=0.0, std=0.01):
-    classname = m.__class__.__name__
-    if classname.find("Conv") != -1:
-        m.weight.data.normal_(mean, std)
-
-
-def get_padding(kernel_size, dilation=1):
-    return int((kernel_size * dilation - dilation) / 2)

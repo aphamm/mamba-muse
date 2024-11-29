@@ -6,7 +6,7 @@
     },
 
     "wandb": {
-        "key": "SAVE_WANDB_KEY_HERE",
+        "key": "KEY_HERE", 
         "project": "mamba-muse",
         "run_name": "run-1"
     },
@@ -36,10 +36,10 @@
         "dis_max_norm": 2.0,
         "patience": 5
     },
-
+   
     "mamba": {
         "d_state": 16,
-        "d_conv": 4,
+        "d_conv": 4, 
         "expand": 2
     },
 
