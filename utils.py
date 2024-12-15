@@ -68,11 +68,9 @@ def stft_loss_fn(sr):
     )
 
 
-def save_epoch(gen, mpd, msd, optim_g, optim_d, epoch, checkpoint_dir):
+def save_epoch(gen, mpd, msd, optim_g, optim_d, epoch):
     epoch_name = f"epoch_{epoch:02d}"
-    checkpoint_path = (
-        CHECKPOINT_DIR / epoch_name
-    )  # os.path.join(checkpoint_dir, epoch_name)
+    checkpoint_path = CHECKPOINT_DIR / epoch_name
     torch.save(
         {
             "gen": gen.state_dict(),
@@ -84,7 +82,6 @@ def save_epoch(gen, mpd, msd, optim_g, optim_d, epoch, checkpoint_dir):
         },
         checkpoint_path,
     )
-    print(f"checkpoint saved for {epoch_name}")
 
 
 def wandb_mel(mel, sr, caption):

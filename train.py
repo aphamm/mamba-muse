@@ -1,7 +1,6 @@
 import glob
 import itertools
 import json
-import os
 import time
 
 import numpy as np
@@ -9,6 +8,7 @@ import torch
 import torch.nn.functional as F
 import wandb
 from librosa import power_to_db
+from torch.autograd import Variable
 from torch.nn.utils import clip_grad_norm_
 from torch.optim.lr_scheduler import ExponentialLR
 from torch.utils.data import DataLoader
@@ -22,6 +22,7 @@ from models import (
     discriminator_loss,
     generator_loss,
 )
+from run_train import CHECKPOINT_DIR
 from utils import (
     AttrDict,
     WarmupScheduler,
@@ -42,12 +43,16 @@ def validation(gen, valid_loader, device, cfg):
             x = x.to(device, non_blocking=True)
             y_hat = gen(x)
 
-            y_mel = torch.from_numpy(mel_spectrogram(x.squeeze(1), cfg)).to(
-                device, non_blocking=True
+            y_mel = Variable(
+                torch.from_numpy(mel_spectrogram(x.squeeze(1), cfg)).to(
+                    device, non_blocking=True
+                )
             )
 
-            y_hat_mel = torch.from_numpy(mel_spectrogram(y_hat.squeeze(1), cfg)).to(
-                device, non_blocking=True
+            y_hat_mel = Variable(
+                torch.from_numpy(mel_spectrogram(y_hat.squeeze(1), cfg)).to(
+                    device, non_blocking=True
+                )
             )
 
             loss_mel = F.l1_loss(y_mel, y_hat_mel)
@@ -133,15 +138,12 @@ def train(cfg):
     # CHECKPOINTS #
     ###############
 
-    os.makedirs(cfg.path["checkpoint_dir"], exist_ok=True)
-    results = glob.glob(os.path.join(cfg.path["checkpoint_dir"], "*"))
+    results = glob.glob(str(CHECKPOINT_DIR) + "/epoch_*")
 
     if len(results) > 0:
         checkpoint = sorted(results)[-1]
         print(f"loading checkpoint from {checkpoint}")
-
         state_dict = torch.load(checkpoint, map_location=device)
-
         gen.load_state_dict(state_dict["gen"])
         mpd.load_state_dict(state_dict["mpd"])
         msd.load_state_dict(state_dict["msd"])
@@ -155,7 +157,7 @@ def train(cfg):
     gamma = cfg.train["lr_decay"]
 
     scheduler_g_warmup = WarmupScheduler(optim_g, warmup_steps=warmup, base_lr=lr)
-    scheduler_d_warmup = WarmupScheduler(optim_g, warmup_steps=warmup, base_lr=lr)
+    scheduler_d_warmup = WarmupScheduler(optim_d, warmup_steps=warmup, base_lr=lr)
 
     scheduler_g_decay = ExponentialLR(optim_g, gamma=gamma, last_epoch=last_epoch)
     scheduler_d_decay = ExponentialLR(optim_d, gamma=gamma, last_epoch=last_epoch)
@@ -178,28 +180,32 @@ def train(cfg):
         for i, x in tqdm(
             enumerate(train_loader), unit="batches", total=len(train_loader)
         ):
-            x = x.to(device, non_blocking=True)
+            x = Variable(x.to(device, non_blocking=True))
             y_hat = gen(x)
 
-            y_mel = torch.from_numpy(mel_spectrogram(x.squeeze(1), cfg)).to(
-                device, non_blocking=True
+            y_mel = Variable(
+                torch.from_numpy(mel_spectrogram(x.squeeze(1), cfg)).to(
+                    device, non_blocking=True
+                )
             )
 
-            nan_mask = torch.isnan(y_hat)
-            if torch.any(nan_mask):
-                nan_indices = torch.nonzero(nan_mask)
-                print(f"nan_indices: {nan_indices}")
-                y_hat = torch.where(nan_mask, torch.zeros_like(y_hat), y_hat)
+            try:
+                y_hat_mel = torch.from_numpy(mel_spectrogram(y_hat.squeeze(1), cfg))
+            except Exception as e:
+                print(f"exception: {e}")
+                nan_mask = torch.isnan(y_hat)
+                if torch.any(nan_mask):
+                    nan_indices = torch.nonzero(nan_mask)
+                    print(f"nan_indices: {nan_indices}")
+                    y_hat = torch.where(nan_mask, torch.zeros_like(y_hat), y_hat)
 
-            inf_mask = torch.isinf(y_hat)
-            if torch.any(inf_mask):
-                inf_indices = torch.nonzero(inf_mask)
-                print(f"inf_indices: {inf_indices}")
-                y_hat = torch.where(inf_mask, torch.zeros_like(y_hat), y_hat)
+                inf_mask = torch.isinf(y_hat)
+                if torch.any(inf_mask):
+                    inf_indices = torch.nonzero(inf_mask)
+                    print(f"inf_indices: {inf_indices}")
+                    y_hat = torch.where(inf_mask, torch.zeros_like(y_hat), y_hat)
 
-            y_hat_mel = torch.from_numpy(mel_spectrogram(y_hat.squeeze(1), cfg)).to(
-                device, non_blocking=True
-            )
+            y_hat_mel = Variable(y_hat_mel.to(device, non_blocking=True))
 
             ##################
             # GENERATOR LOSS #
@@ -292,12 +298,12 @@ def train(cfg):
         if val_err < previous_best_val_err:
             previous_best_val_err = val_err
             nums_did_not_improve = 0
-            print(f"saving epoch {epoch}")
-            save_epoch(
-                gen, mpd, msd, optim_g, optim_d, epoch, cfg.path["checkpoint_dir"]
-            )
+            print(f"val_error decrease: saving epoch {epoch}")
+            save_epoch(gen, mpd, msd, optim_g, optim_d, epoch)
         else:
             nums_did_not_improve += 1
+            print(f"val_error constant: saving epoch {epoch}")
+            save_epoch(gen, mpd, msd, optim_g, optim_d, epoch)
 
         ################
         # END OF EPOCH #

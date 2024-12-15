@@ -1,10 +1,10 @@
-import os
-
 import aiohttp
 import librosa
 import torch
 from datasets import load_dataset
 from torch.utils.data import Dataset
+
+from run_train import CHECKPOINT_DIR
 
 
 class NSynthDataset(Dataset):
@@ -12,7 +12,7 @@ class NSynthDataset(Dataset):
         nsynth = load_dataset(
             cfg.path["data"],
             trust_remote_code=True,
-            cache_dir=os.getcwd() + "/" + cfg.path["data_dir"],
+            cache_dir=CHECKPOINT_DIR,
             storage_options={
                 "client_kwargs": {"timeout": aiohttp.ClientTimeout(total=3600)}
             },  # https://github.com/huggingface/datasets/issues/7164
