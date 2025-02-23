@@ -4,10 +4,14 @@ Real-time, one-shot timbre transfer using a U-Net-based architecture that integr
 
 ### Install Dependencies
 
+Sign up using a free modal account and get `$30` worth of compute credit. Optionally, change the `wandb.key` in `config.json`.
+
+
 ```bash
 $ virtualenv .venv
 $ source .venv/bin/activate
-$ pip install -r requirements.txt
+$ pip install modal
+$ modal setup
 ```
 
 ### Run on [Modal](https://modal.com/docs)
